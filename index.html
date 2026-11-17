@@ -379,7 +379,7 @@ footer{margin:46px 0 30px;padding-top:22px;border-top:1px solid var(--line);colo
     <div class="h2"><h2>Methodology & FAQ</h2></div>
     <details><summary>Where does the data come from?</summary><p>Everything is fetched live in your browser: full transaction and token-transfer history from the public Base Blockscout API, balance and nonce from Base public RPC nodes (mainnet.base.org and fallbacks), ETH price from CoinGecko (with Chainlink on Base as fallback) and network TVL from DefiLlama. No API keys, no backend, nothing stored.</p></details>
     <details><summary>How is the score calculated?</summary><p>Arbitrum's 2023 rules applied to Base: 1 pt for bridging/funding, up to 3 pts for active months (2/6/9+), up to 4 pts for transactions or distinct contracts (4/10/25/100+), up to 3 pts for transaction volume ($10K/$50K/$250K) and up to 3 pts for stablecoin/ETH inflows ($10K/$50K/$250K). Sybil penalties subtract a point if all activity happened inside 48 hours or the wallet is near-empty with almost no activity. Minimum 3 points to qualify.</p></details>
-    <details><summary>What is the "Base-native score"?</summary><p>Signals Base itself might care about that Arbitrum didn't measure: owning a Basename, being active before the 15 Sep 2025 token announcement, consistent weekly use, breadth of apps used and recent (last 90 days) activity. It's shown separately and doesn't change the ARB-model token estimate.</p></details>
+    <details><summary>What is the "Base-native score"?</summary><p>Signals Base itself might care about that Arbitrum didn't measure: owning a Basename, a linked Farcaster account, using a smart wallet, being active before the 15 Sep 2025 token announcement, consistent weekly use, breadth of apps used and recent (last 90 days) activity. It's shown separately and doesn't change the ARB-model token estimate.</p></details>
     <details><summary>How are token amounts estimated?</summary><p>Each point tier maps to Arbitrum's actual per-wallet allocation (1,250 → 10,250 tokens), scaled by your chosen airdrop % relative to Arbitrum's 12.75%. Value = tokens × (FDV ÷ 10B). Both supply and allocation are assumptions — Base hasn't published any.</p></details>
     <details><summary>Why might my numbers differ from Basescan?</summary><p>Very active wallets are capped at the most recent 10,000 transactions and token transfers to keep the scan fast. Volume counts native ETH moved plus major stablecoins, WETH, cbETH and cbBTC; other tokens are ignored to filter out spam airdrops.</p></details>
   </section>
@@ -453,13 +453,33 @@ async function loadNetwork(){
 }
 
 // ═════════════ FETCH WALLET ═════════════
-async function pages(action,addr,maxPages=1){
-  let all=[];
-  for(let p=1;p<=maxPages;p++){
-    const d=await jget(`${BS}/api?module=account&action=${action}&address=${addr}&page=${p}&offset=10000&sort=desc`);
-    const r=Array.isArray(d.result)?d.result:[];all=all.concat(r);if(r.length<10000)break;
+// Fast path: Etherscan-style endpoint (10k rows in one call, small per-IP quota).
+// Fallback: Blockscout v2 REST (50 rows/page, much higher quota) mapped to the same shape.
+let useV2=false;
+async function pages(action,addr){
+  if(!useV2){
+    try{const r=await fetch(`${BS}/api?module=account&action=${action}&address=${addr}&page=1&offset=10000&sort=desc`);
+      if(r.ok){const d=await r.json();if(Array.isArray(d.result))return d.result;if(d.message==='No transactions found'||d.message==='No token transfers found')return[]}
+      if(r.status===429)useV2=true;}catch{useV2=true}
   }
-  return all;
+  return v2pages(action,addr,action==='txlist'?40:30);
+}
+async function v2pages(action,addr,maxPages){
+  const ep=action==='txlist'?'transactions':'token-transfers';
+  const base=`${BS}/api/v2/addresses/${addr}/${ep}`+(action==='tokentx'?'?type=ERC-20':'');
+  let out=[],next=null;
+  for(let p=0;p<maxPages;p++){
+    const q=next?(base.includes('?')?'&':'?')+new URLSearchParams(next).toString():'';
+    const d=await jget(base+q,4);const items=d.items||[];
+    for(const x of items){
+      const ts=Math.floor(Date.parse(x.timestamp)/1000);
+      if(action==='txlist')out.push({from:x.from?.hash||'',to:x.to?.hash||'',value:x.value||'0',timeStamp:ts,isError:x.status==='error'?'1':'0',input:x.raw_input||'0x',contractAddress:x.created_contract?.hash||'',hash:x.hash});
+      else out.push({from:x.from?.hash||'',to:x.to?.hash||'',contractAddress:x.token?.address_hash||x.token?.address||'',value:x.total?.value||'0',timeStamp:ts,hash:x.transaction_hash});
+    }
+    if(!d.next_page_params||!items.length)break;next=d.next_page_params;await sleep(120);
+  }
+  if(out.length>=maxPages*50)out._capped=true;
+  return out;
 }
 function step(id,state){const el=$(id);el.classList.remove('active','done');if(state)el.classList.add(state)}
 
@@ -516,8 +536,12 @@ function analyze(addr,txs,tts,ethBal,nonce,info){
     if(isSender){mark(ts);ethVol+=v;if(t.to&&t.input&&t.input!=='0x')contracts.add(t.to.toLowerCase());if(!t.to&&t.contractAddress)contracts.add('deploy:'+t.contractAddress)}
     else{ethIn+=v;if(v>0)fromBridge=true}
   }
-  // smart-wallet / AA: count incoming-tx activity months too when nonce is 0
-  if(!sent.length){for(const t of txs){mark(+t.timeStamp)}}
+  // Smart wallets (Coinbase Smart Wallet / ERC-4337) never "send" txs themselves:
+  // their activity shows up as incoming calls and token transfers, so count those.
+  const smart=!!info?.is_contract;
+  const hashes=new Set();
+  if(!sent.length||smart){for(const t of txs){if(t.isError==='1')continue;mark(+t.timeStamp);hashes.add(t.hash||t.timeStamp+t.to)}
+    for(const t of tts){mark(+t.timeStamp);hashes.add(t.hash||t.timeStamp+t.contractAddress);if(t.from?.toLowerCase()===addr&&t.to)contracts.add(t.to.toLowerCase())}}
   let stableIn=0,stableVol=0,assetIn=0,inflowN=0;const tokensUsed=new Set();
   for(const t of tts){
     const meta=TOKENS[t.contractAddress?.toLowerCase()];
@@ -535,13 +559,14 @@ function analyze(addr,txs,tts,ethBal,nonce,info){
   // 48h window check
   const span=last&&first?last-first:0;
   return{
-    ethBal,nonce,txCount:sent.length||nonce,allTx:txs.length,tts:tts.length,
+    ethBal,nonce,txCount:Math.max(sent.length,nonce,smart||!sent.length?hashes.size:0),allTx:txs.length+(smart?tts.length:0),tts:tts.length,smart,
+    farcaster:(info?.metadata?.tags||[]).find(t=>t.slug==='warpcast-account')?.meta?.warpcastHandle||((info?.metadata?.tags||[]).some(t=>/farcaster|warpcast/i.test(t.slug+t.name))?'linked':null),
     activeMonths:months.size,months,activeWeeks:weeks.size,activeDays:days.size,recent90,
     contracts:contracts.size,tokens:tokensUsed.size,
     volUSD:ethVol*px.eth+stableVol,ethVolUSD:ethVol*px.eth,inUSD:assetIn+ethIn*px.eth,stableIn,inflowN,
     bridged:fromBridge||ethBal>0,first,last,span,
     basename:info?.ens_domain_name||null,isContract:!!info?.is_contract,
-    capped:txs.length>=10000||tts.length>=10000,ethPx:px.eth
+    capped:txs.length>=10000||tts.length>=10000||!!txs._capped||!!tts._capped,ethPx:px.eth
   };
 }
 
@@ -568,6 +593,8 @@ const PEN=[
 ];
 const BONUS=[
  {id:'bn',t:'Owns a Basename',v:d=>d.basename||'None found',ok:d=>!!d.basename},
+ {id:'fc',t:'Linked Farcaster account',v:d=>d.farcaster?(d.farcaster==='linked'?'Linked':'@'+d.farcaster):'Not linked',ok:d=>!!d.farcaster},
+ {id:'sw',t:'Uses a smart wallet',v:d=>d.smart?'Smart contract wallet':'Regular EOA',ok:d=>d.smart},
  {id:'early',t:'Active before 15 Sep 2025',v:d=>d.first?'First seen '+new Date(d.first*1000).toLocaleDateString('en-GB',{month:'short',year:'numeric'}):'—',ok:d=>d.first&&d.first<ANNOUNCE_TS},
  {id:'weeks',t:'20+ active weeks',v:d=>`${d.activeWeeks} active weeks`,ok:d=>d.activeWeeks>=20},
  {id:'apps',t:'15+ distinct contracts',v:d=>`${d.contracts} contracts`,ok:d=>d.contracts>=15},
@@ -631,7 +658,7 @@ function render(){
     ['First activity',d.first?new Date(d.first*1000).toLocaleDateString('en-GB'):'—',''],['Last activity',d.last?new Date(d.last*1000).toLocaleDateString('en-GB'):'—',d.recent90+' days active (90d)'],
   ];
   $('metrics').innerHTML=M.map(([k,v,s])=>`<div class="m"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join('');
-  $('data-note').textContent=(d.capped?'Very active wallet: analysis uses the latest 10,000 transactions / transfers. ':'')+`Live data · ETH $${d.ethPx.toLocaleString('en-US',{maximumFractionDigits:0})} · fetched ${new Date().toLocaleTimeString()}`;
+  $('data-note').textContent=(d.capped?'Very active wallet: analysis uses the most recent transactions only. ':'')+(useV2?'Source: Blockscout v2 (fallback). ':'')+`Live data · ETH $${d.ethPx.toLocaleString('en-US',{maximumFractionDigits:0})} · fetched ${new Date().toLocaleTimeString()}`;
 
   // tips
   const tips=[];
