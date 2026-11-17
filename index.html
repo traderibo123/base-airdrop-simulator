@@ -228,12 +228,12 @@ footer{margin:46px 0 30px;padding-top:22px;border-top:1px solid var(--line);colo
     <div class="hero-in">
       <span class="pill"><i></i>No Base token yet · speculative tool</span>
       <h1>How big could your <em>Base</em> airdrop be?</h1>
-      <p class="lede">Paste any Base wallet. We pull its full on-chain history live, score it with Arbitrum's airdrop rules, and price it at the FDV you choose.</p>
+      <p class="lede">Paste any Base wallet or Basename. We pull its full on-chain history live, score it with Arbitrum's airdrop rules, and price it at the FDV you choose.</p>
       <form class="search" onsubmit="event.preventDefault();run()">
-        <input id="addr-in" placeholder="0x… wallet address" autocomplete="off" spellcheck="false">
+        <input id="addr-in" placeholder="0x… address or name.base.eth" autocomplete="off" spellcheck="false">
         <button class="btn" id="scan-btn" type="submit">Analyze wallet →</button>
       </form>
-      <div class="hint">Read-only — no wallet connection, no signatures. <button type="button" onclick="demo()">Try an example wallet</button></div>
+      <div class="hint">Read-only — no wallet connection, no signatures. Try <button type="button" onclick="$('addr-in').value='traderibo.base.eth';run()">traderibo.base.eth</button> or <button type="button" onclick="demo()">a random active wallet</button></div>
     </div>
   </div>
 
@@ -453,16 +453,19 @@ async function loadNetwork(){
 }
 
 // ═════════════ FETCH WALLET ═════════════
-// Fast path: Etherscan-style endpoint (10k rows in one call, small per-IP quota).
-// Fallback: Blockscout v2 REST (50 rows/page, much higher quota) mapped to the same shape.
-let useV2=false;
-async function pages(action,addr){
-  if(!useV2){
-    try{const r=await fetch(`${BS}/api?module=account&action=${action}&address=${addr}&page=1&offset=10000&sort=desc`);
-      if(r.ok){const d=await r.json();if(Array.isArray(d.result))return d.result;if(d.message==='No transactions found'||d.message==='No token transfers found')return[]}
-      if(r.status===429)useV2=true;}catch{useV2=true}
-  }
-  return v2pages(action,addr,action==='txlist'?40:30);
+// First-of-month block numbers on Base (measured on-chain). Later months are extrapolated live.
+const MONTH_BLOCKS=[[2023,7,690127],[2023,8,2029327],[2023,9,3368527],[2023,10,4664527],[2023,11,6003727],[2023,12,7299727],[2024,1,8638927],[2024,2,9978127],[2024,3,11230927],[2024,4,12570127],[2024,5,13866127],[2024,6,15205327],[2024,7,16501327],[2024,8,17840527],[2024,9,19179727],[2024,10,20475727],[2024,11,21814927],[2024,12,23110927],[2025,1,24450127],[2025,2,25789327],[2025,3,26998927],[2025,4,28338127],[2025,5,29634127],[2025,6,30973327],[2025,7,32269327],[2025,8,33608527],[2025,9,34947727],[2025,10,36243727],[2025,11,37582927],[2025,12,38878927],[2026,1,40218127],[2026,2,41557327],[2026,3,42766927],[2026,4,44106127],[2026,5,45402127],[2026,6,46741327],[2026,7,48037327],[2026,8,49376527],[2026,9,50715727],[2026,10,52011727],[2026,11,53350927]];
+
+// Fast path: Etherscan-style endpoint (10k rows per call, but a small per-IP quota).
+// Fallback when that quota is hit: RPC nonce checkpoints (exact months/tx count for normal wallets)
+// + first pages of Blockscout v2 (recent volume, contracts, inflows).
+let degraded=false;
+async function legacy(action,addr){
+  const r=await fetch(`${BS}/api?module=account&action=${action}&address=${addr}&page=1&offset=10000&sort=desc`);
+  if(r.status===429)throw Object.assign(new Error('rate'),{rate:true});
+  const d=await r.json();if(Array.isArray(d.result))return d.result;
+  if(/No (transactions|token transfers) found/i.test(d.message||''))return[];
+  throw Object.assign(new Error(d.message||'blockscout'),{rate:/limit|many/i.test(d.result||d.message||'')});
 }
 async function v2pages(action,addr,maxPages){
   const ep=action==='txlist'?'transactions':'token-transfers';
@@ -470,40 +473,86 @@ async function v2pages(action,addr,maxPages){
   let out=[],next=null;
   for(let p=0;p<maxPages;p++){
     const q=next?(base.includes('?')?'&':'?')+new URLSearchParams(next).toString():'';
-    const d=await jget(base+q,4);const items=d.items||[];
+    let d;try{d=await jget(base+q,2)}catch{break}
+    const items=d.items||[];
     for(const x of items){
       const ts=Math.floor(Date.parse(x.timestamp)/1000);
       if(action==='txlist')out.push({from:x.from?.hash||'',to:x.to?.hash||'',value:x.value||'0',timeStamp:ts,isError:x.status==='error'?'1':'0',input:x.raw_input||'0x',contractAddress:x.created_contract?.hash||'',hash:x.hash});
       else out.push({from:x.from?.hash||'',to:x.to?.hash||'',contractAddress:x.token?.address_hash||x.token?.address||'',value:x.total?.value||'0',timeStamp:ts,hash:x.transaction_hash});
     }
-    if(!d.next_page_params||!items.length)break;next=d.next_page_params;await sleep(120);
+    if(!d.next_page_params||!items.length)break;next=d.next_page_params;
   }
-  if(out.length>=maxPages*50)out._capped=true;
+  if(next)out._capped=true;
   return out;
+}
+async function monthCheckpoints(){
+  const list=MONTH_BLOCKS.map(x=>x.slice());
+  try{ // extrapolate months after the table using the live block time
+    const lb=unhex(await rpc('eth_blockNumber',[]));
+    const [b1,b0]=await Promise.all([rpc('eth_getBlockByNumber',[hex(lb),false]),rpc('eth_getBlockByNumber',[hex(lb-50000),false])]);
+    const t1=unhex(b1.timestamp),bt=(t1-unhex(b0.timestamp))/50000;
+    let [y,m]=list[list.length-1];
+    for(;;){m++;if(m>12){m=1;y++}const ts=Date.UTC(y,m-1,1)/1000;if(ts>t1)break;list.push([y,m,Math.round(lb-(t1-ts)/bt)])}
+  }catch{}
+  return list;
+}
+async function nonceHistory(addr,nonceNow){
+  if(!nonceNow)return null;
+  const cps=await monthCheckpoints();const res=new Array(cps.length);let i=0;
+  const worker=async()=>{while(i<cps.length){const k=i++;try{res[k]=unhex(await rpc('eth_getTransactionCount',[addr,hex(cps[k][2])]))}catch{res[k]=null}}};
+  await Promise.all([1,2,3,4,5,6].map(worker));
+  const months=new Map();let first=0;
+  for(let k=0;k<cps.length;k++){
+    const a=res[k],b=k+1<cps.length?res[k+1]:nonceNow;if(a==null||b==null)continue;
+    if(b>a){const [y,m]=k===0?[2023,7]:cps[k];months.set(y*100+m,b-a);if(!first)first=Date.UTC(y,m-1,1)/1000}
+  }
+  if(res[0]>0){months.set(202306,res[0]);first=Date.UTC(2023,5,15)/1000}
+  return{months,first};
+}
+// Resolve name.base.eth / name.eth / bare "name" to an address
+async function resolveName(q){
+  let name=q.toLowerCase().replace(/^@/,'');
+  if(!/\./.test(name))name+='.base.eth';
+  const d=await jget(`${BS}/api/v2/search?q=${encodeURIComponent(name)}`,2);
+  const hit=(d.items||[]).find(i=>(i.ens_info?.name||i.name||'').toLowerCase()===name)||(d.items||[]).find(i=>i.type==='ens_domain');
+  if(!hit?.address_hash)throw new Error(`Couldn't find “${name}”. Check the spelling or paste the 0x address.`);
+  return{addr:hit.address_hash.toLowerCase(),name:hit.ens_info?.name||name};
 }
 function step(id,state){const el=$(id);el.classList.remove('active','done');if(state)el.classList.add(state)}
 
 async function run(addrArg){
-  const raw=(addrArg||$('addr-in').value).trim();
-  if(!/^0x[0-9a-fA-F]{40}$/.test(raw)){msg('msg','error','Enter a valid address — 0x followed by 40 hex characters.');return}
-  const addr=raw.toLowerCase();$('addr-in').value=raw;
+  let raw=(addrArg||$('addr-in').value).trim();
+  if(!raw){msg('msg','error','Enter a wallet address or a Basename like yourname.base.eth');return}
+  const isAddr=/^0x[0-9a-fA-F]{40}$/.test(raw);
+  if(!isAddr&&!/^@?[a-z0-9-]+(\.[a-z0-9-]+)*$/i.test(raw)){msg('msg','error','Enter a 0x address (42 characters) or a Basename like <b>yourname.base.eth</b>.');return}
   const btn=$('scan-btn');btn.disabled=true;btn.textContent='Scanning…';
   $('results').style.display='none';$('progress').style.display='block';msg('msg');
   ['s1','s2','s3','s4','s5','s6'].forEach(s=>step(s));
+  degraded=false;
   try{
+    let addr=raw.toLowerCase(),resolved=null;
+    if(!isAddr){msg('msg','info','Resolving '+raw+'…');resolved=await resolveName(raw);addr=resolved.addr;msg('msg')}
     if(!ST.px.eth)await loadPrices();
     step('s1','active');
-    const [balHex,nonceHex,info]=await Promise.all([
+    const [balHex,nonceHex,info,counters]=await Promise.all([
       rpc('eth_getBalance',[addr,'latest']),rpc('eth_getTransactionCount',[addr,'latest']),
-      jget(`${BS}/api/v2/addresses/${addr}`,2).catch(()=>({}))]);
+      jget(`${BS}/api/v2/addresses/${addr}`,2).catch(()=>({})),
+      jget(`${BS}/api/v2/addresses/${addr}/counters`,2).catch(()=>({}))]);
     const ethBal=unhex(balHex)/1e18,nonce=unhex(nonceHex);step('s1','done');
+    if(resolved&&!info.ens_domain_name)info.ens_domain_name=resolved.name;
 
     step('s2','active');step('s3','active');
-    msg('msg','info','Reading full on-chain history — busy wallets can take 10–20 s…');
-    const [txs,tts,firstTx]=await Promise.all([
-      pages('txlist',addr,1).then(r=>{step('s2','done');return r}),
-      pages('tokentx',addr,1).then(r=>{step('s3','done');return r}),
-      jget(`${BS}/api?module=account&action=txlist&address=${addr}&page=1&offset=1&sort=asc`,2).then(d=>+(d.result?.[0]?.timeStamp||0)).catch(()=>0)]);
+    msg('msg','info','Reading on-chain history — busy wallets can take 10–20 s…');
+    let txs,tts,nh=null;
+    try{
+      [txs,tts]=await Promise.all([legacy('txlist',addr).then(r=>{step('s2','done');return r}),legacy('tokentx',addr).then(r=>{step('s3','done');return r})]);
+    }catch(e){
+      degraded=true;msg('msg','info','Explorer is busy — switching to direct RPC scan (≈15 s)…');
+      [txs,tts,nh]=await Promise.all([
+        v2pages('txlist',addr,3).then(r=>{step('s2','done');return r}),
+        v2pages('tokentx',addr,3).then(r=>{step('s3','done');return r}),
+        nonceHistory(addr,nonce)]);
+    }
     msg('msg');
 
     if(!txs.length&&!tts.length&&nonce===0&&ethBal<1e-5){
@@ -511,15 +560,20 @@ async function run(addrArg){
       msg('msg','warn','This address has no activity on Base mainnet yet — score 0. Bridge some ETH and start using Base apps to begin qualifying.');return}
 
     step('s4','active');const d=analyze(addr,txs,tts,ethBal,nonce,info);
-    if(firstTx&&(!d.first||firstTx<d.first))d.first=firstTx;d.span=d.last&&d.first?d.last-d.first:0;step('s4','done');
+    if(nh){ // exact month activity from nonce checkpoints
+      for(const [k,v] of nh.months)if(!d.months.has(k))d.months.set(k,v);
+      d.activeMonths=d.months.size;if(nh.first&&(!d.first||nh.first<d.first))d.first=nh.first;
+    }
+    const tc=+counters.transactions_count||0;if(degraded&&tc>d.txCount)d.txCount=tc;
+    d.span=d.last&&d.first?d.last-d.first:0;d.degraded=degraded;step('s4','done');
     step('s5','active');await sleep(150);step('s5','done');
-    step('s6','active');const sc=score(d);ST.res={addr,d,sc};step('s6','done');
+    step('s6','active');const sc=score(d);ST.res={addr,d,sc,label:resolved?.name||info.ens_domain_name||null};step('s6','done');
     $('progress').style.display='none';
-    render();history.replaceState(null,'','?a='+addr);
+    render();history.replaceState(null,'','?a='+(resolved?resolved.name:addr));
     $('results').style.display='block';$('results').scrollIntoView({behavior:'smooth',block:'start'});
   }catch(e){
     $('progress').style.display='none';
-    msg('msg','error','Could not load data: '+e.message+'. Public APIs may be busy — try again in a few seconds.');
+    msg('msg','error',(e.message.startsWith('Couldn')?e.message:'Could not load data: '+e.message+'. Public APIs may be busy — try again in a few seconds.'));
   }finally{btn.disabled=false;btn.textContent='Analyze wallet →'}
 }
 
@@ -658,7 +712,7 @@ function render(){
     ['First activity',d.first?new Date(d.first*1000).toLocaleDateString('en-GB'):'—',''],['Last activity',d.last?new Date(d.last*1000).toLocaleDateString('en-GB'):'—',d.recent90+' days active (90d)'],
   ];
   $('metrics').innerHTML=M.map(([k,v,s])=>`<div class="m"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s}</div></div>`).join('');
-  $('data-note').textContent=(d.capped?'Very active wallet: analysis uses the most recent transactions only. ':'')+(useV2?'Source: Blockscout v2 (fallback). ':'')+`Live data · ETH $${d.ethPx.toLocaleString('en-US',{maximumFractionDigits:0})} · fetched ${new Date().toLocaleTimeString()}`;
+  $('data-note').textContent=(d.capped?'Very active wallet: analysis uses the most recent transactions only. ':'')+(d.degraded?'Explorer was busy: months & tx count come from RPC; volume/inflows use recent history only. ':'')+`Live data · ETH $${d.ethPx.toLocaleString('en-US',{maximumFractionDigits:0})} · fetched ${new Date().toLocaleTimeString()}`;
 
   // tips
   const tips=[];
@@ -697,7 +751,7 @@ function setAir(a){ST.air=a;$('air').value=a;renderScen()}
 function tab(n,b){document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));document.querySelectorAll('.tab').forEach(t=>t.classList.remove('on'));$('p-'+n).classList.add('on');b.classList.add('on')}
 
 // ═════════════ SHARE ═════════════
-function link(){return location.origin+location.pathname+'?a='+(ST.res?.addr||'')}
+function link(){return location.origin+location.pathname+'?a='+(ST.res?.label||ST.res?.addr||'')}
 function copyLink(){navigator.clipboard.writeText(link()).then(()=>toast('Link copied')).catch(()=>toast(link()))}
 function shareX(){
   if(!ST.res)return;const p=ST.res.sc.pts,t=tierOf(p),tok=tokensFor(p);
@@ -715,6 +769,7 @@ $('air-chips').innerHTML=AIR_CHIPS.map(a=>`<button class="chip" data-v="${a}" on
 setFdv(5);
 loadPrices();loadNetwork();
 const qa=new URLSearchParams(location.search).get('a');if(qa){$('addr-in').value=qa;run(qa)}
+$('addr-in').addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();run()}});
 </script>
 </body>
 </html>
