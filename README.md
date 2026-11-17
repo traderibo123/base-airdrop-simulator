@@ -2,15 +2,18 @@
 
 A speculative tool that scores your Base network on-chain activity against Arbitrum-style airdrop criteria.
 
-🔗 **Live site:** https://YOUR_USERNAME.github.io/base-airdrop-simulator
+🔗 **Live site:** https://traderibo123.github.io/base-airdrop-simulator
 
 ## Features
 
 - 🔵 Enter any Base mainnet wallet address for instant analysis
 - 📊 14-point scoring system modeled after the Arbitrum ARB airdrop
 - 💰 USD value calculator with adjustable FDV ($1B–$20B) and airdrop % (5–20%)
-- ⛓ Live on-chain data via public Base JSON-RPC (no API key required)
-- 📈 Token value chart by point tier
+- ⛓ Full wallet history live from Base Blockscout + public Base RPC (no API key)
+- 📅 Real active months, distinct contracts, ETH + stablecoin volume, 48h sybil check
+- 🟦 Base-native signals: Basename, pre-announcement activity, active weeks
+- 📡 Live network strip: ETH price, Base TVL (DefiLlama), total txs, latest block
+- 🔗 Shareable result links (`?a=0x…`) and one-click share on X
 - 🏆 Tier system: Bronze → Silver → Gold → Diamond
 
 ## How It Works
@@ -42,7 +45,7 @@ The simulator fetches data directly from the Base blockchain using public RPC en
 1. Fork or clone this repository
 2. Go to **Settings → Pages**
 3. Set source to **Deploy from a branch** → `main` → `/ (root)`
-4. Your site will be live at `https://YOUR_USERNAME.github.io/base-airdrop-simulator`
+4. Your site will be live at `https://traderibo123.github.io/base-airdrop-simulator`
 
 ## Disclaimer
 
